@@ -1,71 +1,105 @@
 export class BgVideoLoop {
   constructor(config) {
     this.config = config;
-    this.videoA = this.#createVideo(config.bgVideoPath);
-    this.videoB = this.#createVideo(config.bgVideoPath);
-    this.active = this.videoA;
-    this.incoming = this.videoB;
-    this.alphaIncoming = 0;
-    this.isCrossfading = false;
-    this.crossfadeStart = 0;
+    this.videoA = this.#createVideo();
+    this.videoB = this.#createVideo();
+    this.front = this.videoA;
+    this.back = this.videoB;
+
     this.hasVideo = false;
-    this.needsUserGesture = false;
     this.started = false;
+    this.needsUserGesture = false;
     this.introStart = 0;
+
+    this.phase = "watch"; // watch -> prep -> fade
+    this.fadeAlpha = 0;
+    this.fadeStartSec = 0;
+    this.prepInFlight = false;
+
     this.readyPromise = this.#probeVideo();
   }
 
-  #createVideo(src) {
+  #createVideo() {
     const v = document.createElement("video");
-    v.src = src;
+    v.src = new URL(this.config.bgVideoPath, document.baseURI).toString();
     v.muted = true;
     v.playsInline = true;
     v.preload = "auto";
     v.loop = false;
-    v.crossOrigin = "anonymous";
     return v;
   }
 
-  async #probeVideo() {
-    const canPlay = await new Promise((resolve) => {
-      const onReady = () => {
-        cleanup();
-        resolve(true);
+  async #waitEventOrTimeout(video, events, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      const handlers = events.map((evt) => {
+        const fn = () => finish(true);
+        video.addEventListener(evt, fn, { once: true });
+        return [evt, fn];
+      });
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        for (const [evt, fn] of handlers) video.removeEventListener(evt, fn);
+        resolve(ok);
       };
-      const onError = () => {
-        cleanup();
-        resolve(false);
-      };
-      const cleanup = () => {
-        this.videoA.removeEventListener("loadeddata", onReady);
-        this.videoA.removeEventListener("error", onError);
-      };
-      this.videoA.addEventListener("loadeddata", onReady, { once: true });
-      this.videoA.addEventListener("error", onError, { once: true });
-      this.videoA.load();
     });
+  }
 
-    this.hasVideo = canPlay && Number.isFinite(this.videoA.duration) && this.videoA.duration > 0;
-    if (this.hasVideo) {
-      this.videoB.load();
-    }
+  async #probeVideo() {
+    this.videoA.load();
+    const ok = await this.#waitEventOrTimeout(this.videoA, ["loadedmetadata", "canplay"], 2200);
+    this.hasVideo = ok && Number.isFinite(this.videoA.duration) && this.videoA.duration > 0;
+    if (this.hasVideo) this.videoB.load();
     return this.hasVideo;
+  }
+
+  async #primeBack() {
+    try {
+      this.back.pause();
+      try {
+        this.back.load();
+      } catch (_e) {
+        // ignore
+      }
+      await this.#waitEventOrTimeout(this.back, ["loadedmetadata", "canplay"], 1500);
+      if (typeof this.back.fastSeek === "function") {
+        try {
+          this.back.fastSeek(0);
+        } catch (_e) {
+          this.back.currentTime = 0;
+        }
+      } else {
+        this.back.currentTime = 0;
+      }
+      await this.#waitEventOrTimeout(this.back, ["seeked"], 500);
+      await this.back.play();
+      const ready = await this.#waitEventOrTimeout(this.back, ["playing", "canplaythrough"], 800);
+      return ready || (this.back.readyState >= 3 && this.back.currentTime < 0.08);
+    } catch (_err) {
+      return false;
+    }
   }
 
   async tryStart() {
     await this.readyPromise;
+    this.introStart = performance.now() / 1000;
+
     if (!this.hasVideo) {
       this.started = true;
-      this.introStart = performance.now() / 1000;
+      this.needsUserGesture = false;
       return true;
     }
 
     try {
-      this.active.currentTime = 0;
-      await this.active.play();
+      this.front.currentTime = 0;
+      await this.front.play();
       this.started = true;
       this.needsUserGesture = false;
-      this.introStart = performance.now() / 1000;
+      this.phase = "watch";
+      this.fadeAlpha = 0;
       return true;
     } catch (_err) {
       this.needsUserGesture = true;
@@ -80,69 +114,72 @@ export class BgVideoLoop {
   get introAlpha() {
     if (!this.started) return 0;
     const now = performance.now() / 1000;
-    const t = (now - this.introStart) / this.config.introFadeSeconds;
-    return Math.max(0, Math.min(1, t));
+    const p = (now - this.introStart) / this.config.introFadeSeconds;
+    return Math.max(0, Math.min(1, p));
   }
 
   update(nowSec) {
     if (!this.started || !this.hasVideo) return;
-    const duration = this.active.duration;
+
+    const duration = this.front.duration;
     if (!Number.isFinite(duration) || duration <= this.config.xfadeSeconds) return;
 
-    const threshold = duration - this.config.xfadeSeconds;
-    if (!this.isCrossfading && this.active.currentTime >= threshold) {
-      this.#beginCrossfade(nowSec);
+    const prepTrigger = duration - (this.config.xfadePrepSeconds + this.config.xfadeSeconds);
+    const fadeTrigger = duration - this.config.xfadeSeconds;
+
+    if (this.phase === "watch" && !this.prepInFlight && this.front.currentTime >= prepTrigger) {
+      this.prepInFlight = true;
+      this.phase = "prep";
+      this.#primeBack().then((primed) => {
+        this.prepInFlight = false;
+        if (!primed) this.phase = "watch";
+      });
     }
 
-    if (this.isCrossfading) {
-      const p = (nowSec - this.crossfadeStart) / this.config.xfadeSeconds;
-      this.alphaIncoming = Math.max(0, Math.min(1, p));
-      if (this.alphaIncoming >= 1) {
-        this.#finishCrossfade();
-      }
+    if (this.phase === "prep" && !this.prepInFlight && this.front.currentTime >= fadeTrigger) {
+      this.phase = "fade";
+      this.fadeStartSec = nowSec;
+      this.fadeAlpha = 0;
+    }
+
+    if (this.phase === "fade") {
+      const p = (nowSec - this.fadeStartSec) / this.config.xfadeSeconds;
+      this.fadeAlpha = Math.max(0, Math.min(1, p));
+      if (this.fadeAlpha >= 1) this.#swapFrontBack();
     }
   }
 
-  async #beginCrossfade(nowSec) {
-    this.isCrossfading = true;
-    this.crossfadeStart = nowSec;
-    this.alphaIncoming = 0;
-    this.incoming.currentTime = 0;
+  #swapFrontBack() {
+    this.front.pause();
     try {
-      await this.incoming.play();
-    } catch (_err) {
-      this.isCrossfading = false;
-      this.alphaIncoming = 0;
+      this.front.currentTime = 0;
+    } catch (_e) {
+      // ignore
     }
-  }
-
-  #finishCrossfade() {
-    this.active.pause();
-    this.active.currentTime = 0;
-    const old = this.active;
-    this.active = this.incoming;
-    this.incoming = old;
-    this.isCrossfading = false;
-    this.alphaIncoming = 0;
+    const oldFront = this.front;
+    this.front = this.back;
+    this.back = oldFront;
+    this.phase = "watch";
+    this.fadeAlpha = 0;
   }
 
   render(ctx, w, h) {
-    if (!this.hasVideo) {
+    if (!this.hasVideo || !this.started) {
       const g = ctx.createLinearGradient(0, 0, 0, h);
-      g.addColorStop(0, "#6fb5e8");
-      g.addColorStop(0.5, "#84c77f");
-      g.addColorStop(1, "#4c8f42");
+      g.addColorStop(0, "#75b7e8");
+      g.addColorStop(0.45, "#97cb7c");
+      g.addColorStop(1, "#4f9044");
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, w, h);
       return;
     }
 
     ctx.save();
-    ctx.globalAlpha = this.isCrossfading ? 1 - this.alphaIncoming : 1;
-    ctx.drawImage(this.active, 0, 0, w, h);
-    if (this.isCrossfading) {
-      ctx.globalAlpha = this.alphaIncoming;
-      ctx.drawImage(this.incoming, 0, 0, w, h);
+    ctx.globalAlpha = 1;
+    ctx.drawImage(this.front, 0, 0, w, h);
+    if (this.phase === "fade") {
+      ctx.globalAlpha = this.fadeAlpha;
+      ctx.drawImage(this.back, 0, 0, w, h);
     }
     ctx.restore();
   }

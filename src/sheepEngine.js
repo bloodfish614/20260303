@@ -25,15 +25,20 @@ export class SheepEngine {
       yTop: toY(this.config.yTopDist),
       yMid: toY(this.config.yMidDist),
       yBottom: h,
-      maxDistBottom: this.config.yTopDist,
       wrapLeft: -this.config.wrapMargin,
       wrapRight: w + this.config.wrapMargin,
-      minY: toY(this.config.yTopDist) - 18,
-      maxY: h + this.config.wrapMargin,
+      minYSoft: toY(this.config.yTopDist),
+      maxYSoft: h,
+      minYHard: toY(this.config.yTopDist) - 32,
+      maxYHard: h + this.config.wrapMargin,
     };
   }
 
-  #sizeFromDistBottom(distBottom, hScale) {
+  #distBottomFromY(y) {
+    return ((this.metrics.h - y) / this.metrics.h) * this.config.REF_H;
+  }
+
+  #baseSizeAtDist(distBottom, hScale) {
     const c = this.config;
     const d = Math.max(0, Math.min(c.yTopDist, distBottom));
     let size;
@@ -47,56 +52,95 @@ export class SheepEngine {
     return size * (hScale / c.REF_H);
   }
 
-  #distBottomFromY(y) {
-    return ((this.metrics.h - y) / this.metrics.h) * this.config.REF_H;
+  #renderSizeAtDist(distBottom, hScale) {
+    return this.#baseSizeAtDist(distBottom, hScale) * this.config.globalScale;
   }
 
-  #targetVisibleRange() {
-    return [this.metrics.yTop, this.metrics.yBottom];
+  #depthRatioByY(y) {
+    const baseBottom = this.#baseSizeAtDist(0, this.metrics.h);
+    const base = this.#baseSizeAtDist(this.#distBottomFromY(y), this.metrics.h);
+    return base / baseBottom;
   }
 
-  #spawnOne(id, visibleBias) {
-    const m = this.metrics;
-    const [vyTop, vyBottom] = this.#targetVisibleRange();
-    const visible = visibleBias;
-    const x = visible
-      ? Math.random() * m.w
-      : Math.random() < 0.5
-      ? -this.config.wrapMargin * (0.2 + Math.random())
-      : m.w + this.config.wrapMargin * (0.2 + Math.random());
-    const y = visible
-      ? vyTop + Math.random() * (vyBottom - vyTop)
-      : Math.random() < 0.65
-      ? vyBottom + Math.random() * this.config.wrapMargin
-      : vyTop - Math.random() * 42;
+  #sampleLayeredVisibleY(slot, count) {
+    const { yTop, yBottom } = this.metrics;
+    const bands = Math.max(5, Math.min(8, count));
+    const band = slot % bands;
+    const bandH = (yBottom - yTop) / bands;
+    const jitter = (Math.random() - 0.5) * bandH * 0.6;
+    return yTop + band * bandH + bandH * 0.5 + jitter;
+  }
 
-    const dist = this.#distBottomFromY(y);
-    const hScale = m.h;
-    const sizePx = this.#sizeFromDistBottom(dist, hScale);
-    const depthRatio = sizePx / this.#sizeFromDistBottom(0, hScale);
+  #makeSheep(id, x, y, visible) {
+    const depthRatio = this.#depthRatioByY(y);
     const dir = Math.random() < 0.5 ? -1 : 1;
-    const base = this.config.baseSpeedMin + Math.random() * (this.config.baseSpeedMax - this.config.baseSpeedMin);
-
+    const indivSpeedMul = 0.86 + Math.random() * 0.32;
+    const speed0 = this.config.baseSpeedMin + depthRatio * (this.config.baseSpeedMax - this.config.baseSpeedMin);
     return {
       id,
       x,
       y,
-      vx: dir * base * (0.45 + depthRatio * 0.75),
-      vy: (Math.random() - 0.5) * 4,
-      headingJitter: (Math.random() - 0.5) * 0.15,
-      sizePx,
+      vx: dir * speed0 * indivSpeedMul,
+      vy: 0,
+      yVel: (Math.random() - 0.5) * 4,
+      yDrift: Math.random() * Math.PI * 2,
+      yNoiseVel: (Math.random() - 0.5) * 0.3,
+      turnBias: (Math.random() - 0.5) * 0.04,
+      sizePx: this.#renderSizeAtDist(this.#distBottomFromY(y), this.metrics.h),
+      indivSpeedMul,
       frameIndex: Math.floor(Math.random() * this.config.sheepFrameCount),
       frameTimer: 0,
-      frameRate: 5 + depthRatio * 5 + Math.random() * 1.2,
-      offscreenTime: visible ? 0 : 2 + Math.random() * 2,
+      frameRate: 5,
+      offscreenTime: visible ? 0 : 1.8 + Math.random() * 2.8,
     };
   }
 
+  #isTooClose(candidate, others) {
+    for (const o of others) {
+      const dx = candidate.x - o.x;
+      const dy = candidate.y - o.y;
+      const d2 = dx * dx + dy * dy;
+      const distBottom = this.#distBottomFromY(candidate.y);
+      const r = this.#renderSizeAtDist(distBottom, this.metrics.h) * 0.65;
+      const oDistBottom = this.#distBottomFromY(o.y);
+      const or = this.#renderSizeAtDist(oDistBottom, this.metrics.h) * 0.65;
+      const minD = r + or;
+      if (d2 < minD * minD) return true;
+    }
+    return false;
+  }
+
+  #spawnVisible(id, slot) {
+    const m = this.metrics;
+    let x = 0;
+    let y = 0;
+    let tries = 0;
+    do {
+      x = -this.config.wrapMargin + Math.random() * (m.w + this.config.wrapMargin * 2);
+      y = this.#sampleLayeredVisibleY(slot + tries, this.config.targetVisible);
+      tries += 1;
+    } while (tries < 7 && this.#isTooClose({ x, y }, this.sheep));
+    return this.#makeSheep(id, x, y, true);
+  }
+
+  #spawnOffscreen(id) {
+    const m = this.metrics;
+    const x = Math.random() < 0.5
+      ? -this.config.wrapMargin * (0.2 + Math.random() * 1.2)
+      : m.w + this.config.wrapMargin * (0.2 + Math.random() * 1.2);
+    const y = Math.random() < 0.55
+      ? m.maxYSoft + Math.random() * this.config.wrapMargin
+      : m.minYSoft - 12 - Math.random() * 28;
+    return this.#makeSheep(id, x, y, false);
+  }
+
   #initSheep() {
-    const total = this.config.sheepTotal;
-    const visCount = this.config.targetVisible;
-    for (let i = 0; i < total; i += 1) {
-      this.sheep.push(this.#spawnOne(i, i < visCount));
+    for (let i = 0; i < this.config.sheepTotal; i += 1) {
+      if (i < this.config.targetVisible) {
+        this.sheep.push(this.#spawnVisible(i, i));
+      } else {
+        this.sheep.push(this.#spawnOffscreen(i));
+      }
     }
   }
 
@@ -113,71 +157,78 @@ export class SheepEngine {
         })
       );
     }
-
-    Promise.all(loads).then((arr) => {
-      this.imagesReady = arr.every(Boolean);
+    Promise.all(loads).then((ok) => {
+      this.imagesReady = ok.every(Boolean);
     });
   }
 
   #visibleCount() {
     const m = this.metrics;
-    return this.sheep.filter((s) => s.x >= 0 && s.x <= m.w && s.y >= m.yTop && s.y <= m.h).length;
+    return this.sheep.filter((s) => s.x >= 0 && s.x <= m.w && s.y >= m.yTop && s.y <= m.yBottom).length;
   }
 
   update(dt) {
     this.metrics = this.#buildMetrics();
     const m = this.metrics;
+
     const visibleCount = this.#visibleCount();
     const deficit = this.config.targetVisible - visibleCount;
 
     for (const s of this.sheep) {
-      if (Math.random() < this.config.wanderTurnChancePerSec * dt) {
-        s.headingJitter += (Math.random() - 0.5) * this.config.maxTurnRate;
-      }
-      s.headingJitter *= 0.92;
+      // 深度漂移：低頻 random-walk + damping + 邊界溫和拉回。
+      s.yDrift += s.yNoiseVel * dt;
+      s.yNoiseVel += (Math.random() - 0.5) * 0.16 * dt;
+      s.yNoiseVel *= 0.992;
+      s.yNoiseVel = Math.max(-0.6, Math.min(0.6, s.yNoiseVel));
+      const driftForce = Math.sin(s.yDrift) * 4.5;
 
-      const dist = this.#distBottomFromY(s.y);
-      const sizePx = this.#sizeFromDistBottom(dist, m.h);
+      let pull = 0;
+      if (s.y < m.minYSoft) pull += (m.minYSoft - s.y) * 0.24;
+      if (s.y > m.maxYSoft) pull -= (s.y - m.maxYSoft) * 0.18;
+
+      s.yVel += (driftForce + pull) * dt;
+      s.yVel *= 0.95;
+      s.y += s.yVel;
+
+      if (Math.random() < this.config.wanderTurnChancePerSec * dt) {
+        s.turnBias += (Math.random() - 0.5) * this.config.maxTurnRate;
+      }
+      s.turnBias *= 0.94;
+
+      const distBottom = this.#distBottomFromY(s.y);
+      const baseSizePx = this.#baseSizeAtDist(distBottom, m.h);
+      const sizePx = baseSizePx * this.config.globalScale;
       s.sizePx = sizePx;
-      const depthRatio = sizePx / this.#sizeFromDistBottom(0, m.h);
+      const depthRatio = baseSizePx / this.#baseSizeAtDist(0, m.h);
 
       const speedTarget = (this.config.baseSpeedMin + depthRatio * (this.config.baseSpeedMax - this.config.baseSpeedMin)) *
-        (0.92 + ((s.id * 17) % 11) * 0.01);
-      const sign = Math.sign(s.vx) || 1;
-      s.vx = sign * (Math.abs(s.vx) * 0.94 + speedTarget * 0.06);
-      s.vx += s.headingJitter;
-      s.vy += (Math.random() - 0.5) * 1.6 * dt;
-      s.vy *= 0.96;
+        s.indivSpeedMul;
+      const sign = Math.sign(s.vx) || (Math.random() < 0.5 ? -1 : 1);
+      s.vx = sign * (Math.abs(s.vx) * 0.92 + speedTarget * 0.08);
+      s.vx += s.turnBias;
 
       s.x += s.vx * dt;
-      s.y += s.vy * dt;
 
-      if (s.x < m.wrapLeft) {
-        s.x = m.wrapRight;
-      } else if (s.x > m.wrapRight) {
-        s.x = m.wrapLeft;
-      }
+      if (s.x < m.wrapLeft) s.x = m.wrapRight;
+      if (s.x > m.wrapRight) s.x = m.wrapLeft;
 
-      if (s.y > m.maxY) {
-        s.y = m.minY + Math.random() * 12;
-      }
-      if (s.y < m.minY - 30) {
-        s.y = m.h + Math.random() * (this.config.wrapMargin * 0.6);
-      }
+      if (s.y < m.minYHard) s.y = m.maxYSoft + Math.random() * (this.config.wrapMargin * 0.4);
+      if (s.y > m.maxYHard) s.y = m.minYSoft + Math.random() * 22;
 
-      const inView = s.x >= 0 && s.x <= m.w && s.y >= m.yTop && s.y <= m.h;
+      const inView = s.x >= 0 && s.x <= m.w && s.y >= m.yTop && s.y <= m.yBottom;
       s.offscreenTime = inView ? 0 : s.offscreenTime + dt;
 
-      if (deficit > 2 && !inView && s.offscreenTime > 2.2 && Math.random() < this.config.offscreenReturnBoost * dt) {
-        s.x = Math.random() < 0.5 ? 0 : m.w;
-        s.y = m.yTop + Math.random() * (m.h - m.yTop);
+      if (deficit > 2 && !inView && s.offscreenTime > 1.8 && Math.random() < this.config.offscreenReturnBoost * dt) {
+        s.x = Math.random() < 0.5 ? -8 : m.w + 8;
+        s.y = this.#sampleLayeredVisibleY((s.id + Math.floor(performance.now() / 700)) % 7, this.config.targetVisible);
+        s.yVel *= 0.5;
       }
 
-      if (deficit < -2 && inView && Math.random() < 0.14 * dt) {
-        s.x = s.vx > 0 ? -this.config.wrapMargin * 0.6 : m.w + this.config.wrapMargin * 0.6;
+      if (deficit < -2 && inView && Math.random() < 0.12 * dt) {
+        s.x = s.vx > 0 ? -this.config.wrapMargin * 0.8 : m.w + this.config.wrapMargin * 0.8;
       }
 
-      s.frameRate = 4 + depthRatio * 6 + Math.min(2, Math.abs(s.vx) / 24);
+      s.frameRate = 4 + depthRatio * 5 + Math.min(2.6, Math.abs(s.vx) / 22);
       s.frameTimer += dt;
       const frameDuration = 1 / s.frameRate;
       while (s.frameTimer >= frameDuration) {
@@ -192,14 +243,14 @@ export class SheepEngine {
     const h = sheep.sizePx;
     ctx.fillStyle = "#f7f7f2";
     ctx.beginPath();
-    ctx.ellipse(0, 0, w * 0.4, h * 0.3, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 0, w * 0.42, h * 0.3, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = "#2e2e2e";
     ctx.beginPath();
-    ctx.arc(w * 0.34, h * 0.02, h * 0.15, 0, Math.PI * 2);
+    ctx.arc(w * 0.32, h * 0.03, h * 0.14, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillRect(-w * 0.2, h * 0.16, h * 0.08, h * 0.25);
-    ctx.fillRect(-w * 0.02, h * 0.16, h * 0.08, h * 0.25);
+    ctx.fillRect(-w * 0.22, h * 0.15, h * 0.08, h * 0.24);
+    ctx.fillRect(-w * 0.01, h * 0.15, h * 0.08, h * 0.24);
   }
 
   render(ctx) {

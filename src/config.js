@@ -5,19 +5,25 @@ export const CONFIG = {
   sizeAtTop: 22.5,
   sizeAtMid: 45,
   sizeAtBottom: 67.5,
+  globalScale: 0.8,
+
   sheepTotal: 30,
   targetVisible: 20,
   targetOffscreen: 10,
   wrapMargin: 80,
-  xfadeSeconds: 0.45,
-  introFadeSeconds: 0.8,
+
   bgVideoPath: "assets/bg/grassland.MP4",
+  xfadePrepSeconds: 1.2,
+  xfadeSeconds: 1.0,
+  introFadeSeconds: 0.8,
+
   sheepFramePrefix: "assets/sheep/sheep_rf",
   sheepFrameCount: 6,
   sheepFrameExt: ".png",
-  baseSpeedMin: 14,
-  baseSpeedMax: 28,
-  wanderTurnChancePerSec: 0.23,
-  maxTurnRate: 1.2,
-  offscreenReturnBoost: 0.4,
+
+  baseSpeedMin: 12,
+  baseSpeedMax: 30,
+  wanderTurnChancePerSec: 0.2,
+  maxTurnRate: 0.7,
+  offscreenReturnBoost: 0.45,
 };
