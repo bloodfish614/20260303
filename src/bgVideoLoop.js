@@ -15,6 +15,7 @@ export class BgVideoLoop {
     this.fadeAlpha = 0;
     this.fadeStartSec = 0;
     this.prepInFlight = false;
+    this.backPrimed = false;
 
     this.readyPromise = this.#probeVideo();
   }
@@ -27,6 +28,10 @@ export class BgVideoLoop {
     v.preload = "auto";
     v.loop = false;
     return v;
+  }
+
+  #isDrawable(video) {
+    return video.readyState >= 2 && video.videoWidth > 0;
   }
 
   async #waitEventOrTimeout(video, events, timeoutMs) {
@@ -48,6 +53,10 @@ export class BgVideoLoop {
     });
   }
 
+  async #waitNextFrame() {
+    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
   async #probeVideo() {
     this.videoA.load();
     const ok = await this.#waitEventOrTimeout(this.videoA, ["loadedmetadata", "canplay"], 2200);
@@ -65,6 +74,7 @@ export class BgVideoLoop {
         // ignore
       }
       await this.#waitEventOrTimeout(this.back, ["loadedmetadata", "canplay"], 1500);
+
       if (typeof this.back.fastSeek === "function") {
         try {
           this.back.fastSeek(0);
@@ -74,10 +84,12 @@ export class BgVideoLoop {
       } else {
         this.back.currentTime = 0;
       }
+
       await this.#waitEventOrTimeout(this.back, ["seeked"], 500);
       await this.back.play();
-      const ready = await this.#waitEventOrTimeout(this.back, ["playing", "canplaythrough"], 800);
-      return ready || (this.back.readyState >= 3 && this.back.currentTime < 0.08);
+      const ready = await this.#waitEventOrTimeout(this.back, ["playing", "timeupdate"], 900);
+      await this.#waitNextFrame();
+      return ready || (this.back.readyState >= 3 && this.back.videoWidth > 0);
     } catch (_err) {
       return false;
     }
@@ -100,6 +112,7 @@ export class BgVideoLoop {
       this.needsUserGesture = false;
       this.phase = "watch";
       this.fadeAlpha = 0;
+      this.backPrimed = false;
       return true;
     } catch (_err) {
       this.needsUserGesture = true;
@@ -129,20 +142,25 @@ export class BgVideoLoop {
 
     if (this.phase === "watch" && !this.prepInFlight && this.front.currentTime >= prepTrigger) {
       this.prepInFlight = true;
+      this.backPrimed = false;
       this.phase = "prep";
       this.#primeBack().then((primed) => {
         this.prepInFlight = false;
+        this.backPrimed = primed;
         if (!primed) this.phase = "watch";
       });
     }
 
-    if (this.phase === "prep" && !this.prepInFlight && this.front.currentTime >= fadeTrigger) {
+    if (this.phase === "prep" && !this.prepInFlight && this.backPrimed && this.front.currentTime >= fadeTrigger) {
       this.phase = "fade";
       this.fadeStartSec = nowSec;
       this.fadeAlpha = 0;
     }
 
     if (this.phase === "fade") {
+      if (!this.#isDrawable(this.back)) {
+        return;
+      }
       const p = (nowSec - this.fadeStartSec) / this.config.xfadeSeconds;
       this.fadeAlpha = Math.max(0, Math.min(1, p));
       if (this.fadeAlpha >= 1) this.#swapFrontBack();
@@ -161,6 +179,7 @@ export class BgVideoLoop {
     this.back = oldFront;
     this.phase = "watch";
     this.fadeAlpha = 0;
+    this.backPrimed = false;
   }
 
   render(ctx, w, h) {
@@ -177,7 +196,7 @@ export class BgVideoLoop {
     ctx.save();
     ctx.globalAlpha = 1;
     ctx.drawImage(this.front, 0, 0, w, h);
-    if (this.phase === "fade") {
+    if (this.phase === "fade" && this.#isDrawable(this.back)) {
       ctx.globalAlpha = this.fadeAlpha;
       ctx.drawImage(this.back, 0, 0, w, h);
     }
