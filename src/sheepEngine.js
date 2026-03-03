@@ -38,6 +38,27 @@ export class SheepEngine {
     return ((this.metrics.h - y) / this.metrics.h) * this.config.REF_H;
   }
 
+  #piecewiseMul(distBottom, topMul, midMul, bottomMul) {
+    const c = this.config;
+    const d = Math.max(0, Math.min(c.yTopDist, distBottom));
+    if (d >= c.yMidDist) {
+      const t = (d - c.yMidDist) / (c.yTopDist - c.yMidDist);
+      return midMul + t * (topMul - midMul);
+    }
+    const t = d / c.yMidDist;
+    return bottomMul + t * (midMul - bottomMul);
+  }
+
+  #depthSizeMul(distBottom) {
+    const c = this.config;
+    return this.#piecewiseMul(distBottom, c.depthSizeMulTop, c.depthSizeMulMid, c.depthSizeMulBottom);
+  }
+
+  #depthSpeedMul(distBottom) {
+    const c = this.config;
+    return this.#piecewiseMul(distBottom, c.depthSpeedMulTop, c.depthSpeedMulMid, c.depthSpeedMulBottom);
+  }
+
   #baseSizeAtDist(distBottom, hScale) {
     const c = this.config;
     const d = Math.max(0, Math.min(c.yTopDist, distBottom));
@@ -50,10 +71,6 @@ export class SheepEngine {
       size = c.sizeAtBottom + t * (c.sizeAtMid - c.sizeAtBottom);
     }
     return size * (hScale / c.REF_H);
-  }
-
-  #renderSizeAtDist(distBottom, hScale) {
-    return this.#baseSizeAtDist(distBottom, hScale) * this.config.globalScale;
   }
 
   #depthRatioByY(y) {
@@ -73,21 +90,26 @@ export class SheepEngine {
 
   #makeSheep(id, x, y, visible) {
     const depthRatio = this.#depthRatioByY(y);
+    const distBottom = this.#distBottomFromY(y);
+    const depthSpeedMul = this.#depthSpeedMul(distBottom);
     const dir = Math.random() < 0.5 ? -1 : 1;
-    const indivSpeedMul = 0.75 + Math.random() * 0.55;
+    const indivSpeedMul = 0.72 + Math.random() * 0.62;
     const speedCurve = Math.pow(Math.max(0.05, depthRatio), 1.6);
     const speed0 = this.config.baseSpeedMin + speedCurve * (this.config.baseSpeedMax - this.config.baseSpeedMin);
     return {
       id,
       x,
       y,
-      vx: dir * speed0 * indivSpeedMul,
+      vx: dir * speed0 * depthSpeedMul * indivSpeedMul,
       yVel: (Math.random() - 0.5) * 0.8,
       yDrift: Math.random() * Math.PI * 2,
       yNoiseVel: (Math.random() - 0.5) * 0.25,
       turnBias: (Math.random() - 0.5) * 0.03,
       dirTarget: dir,
-      sizePx: this.#renderSizeAtDist(this.#distBottomFromY(y), this.metrics.h),
+      turnChance: 0.015 + Math.random() * 0.035,
+      turnSmoothing: 1.5 + Math.random() * 1.2,
+      turnTimer: 0.4 + Math.random() * 1.8,
+      sizePx: this.#baseSizeAtDist(distBottom, this.metrics.h) * this.config.globalScale * this.#depthSizeMul(distBottom),
       indivSpeedMul,
       frameIndex: Math.floor(Math.random() * this.config.sheepFrameCount),
       frameTimer: 0,
@@ -102,9 +124,11 @@ export class SheepEngine {
       const dy = candidate.y - o.y;
       const d2 = dx * dx + dy * dy;
       const distBottom = this.#distBottomFromY(candidate.y);
-      const r = this.#renderSizeAtDist(distBottom, this.metrics.h) * 0.65;
+      const baseA = this.#baseSizeAtDist(distBottom, this.metrics.h);
+      const r = baseA * this.config.globalScale * this.#depthSizeMul(distBottom) * 0.65;
       const oDistBottom = this.#distBottomFromY(o.y);
-      const or = this.#renderSizeAtDist(oDistBottom, this.metrics.h) * 0.65;
+      const baseB = this.#baseSizeAtDist(oDistBottom, this.metrics.h);
+      const or = baseB * this.config.globalScale * this.#depthSizeMul(oDistBottom) * 0.65;
       const minD = r + or;
       if (d2 < minD * minD) return true;
     }
@@ -168,6 +192,34 @@ export class SheepEngine {
     return this.sheep.filter((s) => s.x >= 0 && s.x <= m.w && s.y >= m.yTop && s.y <= m.yBottom).length;
   }
 
+  #applySeparation(dt) {
+    const k = this.config.separationStrength;
+    const rm = this.config.separationRadiusMul;
+    for (let i = 0; i < this.sheep.length; i += 1) {
+      const a = this.sheep[i];
+      for (let j = i + 1; j < this.sheep.length; j += 1) {
+        const b = this.sheep[j];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist <= 0.0001) continue;
+
+        const desired = (a.sizePx + b.sizePx) * rm;
+        if (dist >= desired) continue;
+
+        const push = ((desired - dist) / desired) * k;
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const impulse = push * dt;
+
+        a.vx -= nx * impulse;
+        a.yVel -= ny * impulse;
+        b.vx += nx * impulse;
+        b.yVel += ny * impulse;
+      }
+    }
+  }
+
   update(dt) {
     this.metrics = this.#buildMetrics();
     const m = this.metrics;
@@ -179,19 +231,25 @@ export class SheepEngine {
       s.yNoiseVel += (Math.random() - 0.5) * 0.15 * dt;
       s.yNoiseVel *= 0.992;
       s.yNoiseVel = Math.max(-0.55, Math.min(0.55, s.yNoiseVel));
-      const driftForce = Math.sin(s.yDrift) * 4.2;
+      const noiseForce = Math.sin(s.yDrift) * this.config.yDriftStrength;
 
-      let pull = 0;
-      if (s.y < m.minYSoft) pull += (m.minYSoft - s.y) * 0.22;
-      if (s.y > m.maxYSoft) pull -= (s.y - m.maxYSoft) * 0.18;
+      let boundaryPull = 0;
+      if (s.y < m.minYSoft) boundaryPull += (m.minYSoft - s.y) * 0.22;
+      if (s.y > m.maxYSoft) boundaryPull -= (s.y - m.maxYSoft) * 0.18;
 
-      s.yVel += (driftForce + pull) * dt;
-      s.yVel *= 0.95;
+      s.yVel += (noiseForce + boundaryPull) * dt;
+      s.yVel *= this.config.yDamping;
+      s.yVel = Math.max(-this.config.yMaxVel, Math.min(this.config.yMaxVel, s.yVel));
       s.y += s.yVel * dt;
 
-      if (Math.random() < 0.06 * dt) {
-        s.dirTarget = Math.random() < 0.5 ? -1 : 1;
+      s.turnTimer -= dt;
+      if (s.turnTimer <= 0) {
+        if (Math.random() < s.turnChance) {
+          s.dirTarget = Math.random() < 0.5 ? -1 : 1;
+        }
+        s.turnTimer = 0.8 + Math.random() * 2.2;
       }
+
       if (Math.random() < this.config.wanderTurnChancePerSec * dt) {
         s.turnBias += (Math.random() - 0.5) * this.config.maxTurnRate;
       }
@@ -199,26 +257,34 @@ export class SheepEngine {
 
       const distBottom = this.#distBottomFromY(s.y);
       const baseSizePx = this.#baseSizeAtDist(distBottom, m.h);
-      s.sizePx = baseSizePx * this.config.globalScale;
+      const depthSizeMul = this.#depthSizeMul(distBottom);
+      const depthSpeedMul = this.#depthSpeedMul(distBottom);
+      s.sizePx = baseSizePx * this.config.globalScale * depthSizeMul;
+
       const depthRatio = baseSizePx / this.#baseSizeAtDist(0, m.h);
       const speedCurve = Math.pow(Math.max(0.05, depthRatio), 1.6);
+      const speedBase = this.config.baseSpeedMin + speedCurve * (this.config.baseSpeedMax - this.config.baseSpeedMin);
+      const speedTarget = speedBase * depthSpeedMul * s.indivSpeedMul;
 
-      const speedTarget = (this.config.baseSpeedMin + speedCurve * (this.config.baseSpeedMax - this.config.baseSpeedMin)) *
-        s.indivSpeedMul;
       const desiredVx = s.dirTarget * speedTarget;
-      s.vx += (desiredVx - s.vx) * Math.min(1, dt * 1.8);
+      s.vx += (desiredVx - s.vx) * Math.min(1, dt * s.turnSmoothing);
       s.vx += s.turnBias;
 
       s.x += s.vx * dt;
-
       if (s.x < m.wrapLeft) {
         s.x = m.wrapRight - (m.wrapLeft - s.x);
       } else if (s.x > m.wrapRight) {
         s.x = m.wrapLeft + (s.x - m.wrapRight);
       }
 
-      if (s.y < m.minYHard) s.y = m.maxYSoft + Math.random() * (this.config.wrapMargin * 0.4);
-      if (s.y > m.maxYHard) s.y = m.minYSoft + Math.random() * 22;
+      if (s.y < m.minYHard) {
+        s.y += (m.minYHard - s.y) * 0.12;
+        s.yVel *= 0.7;
+      }
+      if (s.y > m.maxYHard) {
+        s.y -= (s.y - m.maxYHard) * 0.12;
+        s.yVel *= 0.7;
+      }
 
       const inView = s.x >= 0 && s.x <= m.w && s.y >= m.yTop && s.y <= m.yBottom;
       s.offscreenTime = inView ? 0 : s.offscreenTime + dt;
@@ -237,6 +303,8 @@ export class SheepEngine {
         s.frameIndex = (s.frameIndex + 1) % this.config.sheepFrameCount;
       }
     }
+
+    this.#applySeparation(dt);
   }
 
   #drawPlaceholder(ctx, sheep) {

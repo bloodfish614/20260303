@@ -26,13 +26,24 @@ window.addEventListener("resize", resize);
 async function bootstrapPlayback() {
   const started = await bg.tryStart();
   tapOverlay.classList.toggle("hidden", started);
+  return started;
 }
 
-tapOverlay.addEventListener("click", bootstrapPlayback);
-canvas.addEventListener("click", () => {
-  if (bg.needsTapToStart) bootstrapPlayback();
+tapOverlay.addEventListener("click", async () => {
+  const started = await bootstrapPlayback();
+  if (started) tapOverlay.classList.add("hidden");
 });
-bootstrapPlayback();
+
+canvas.addEventListener("click", async () => {
+  if (!tapOverlay.classList.contains("hidden") || bg.needsTapToStart) {
+    const started = await bootstrapPlayback();
+    if (started) tapOverlay.classList.add("hidden");
+  }
+});
+
+(async () => {
+  await bootstrapPlayback();
+})();
 
 let last = performance.now();
 function loop(nowMs) {
@@ -57,6 +68,13 @@ function loop(nowMs) {
     ctx.fillRect(0, 0, w, h);
     ctx.restore();
   }
+
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.82)";
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.textBaseline = "top";
+  ctx.fillText(`BUILD ${CONFIG.BUILD}`, 8, 8);
+  ctx.restore();
 
   requestAnimationFrame(loop);
 }
